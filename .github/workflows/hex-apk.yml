@@ -143,15 +143,18 @@ jobs:
 
       - name: Verify APK
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           bt="$ANDROID_SDK_ROOT/build-tools/36.0.0"
           cp src/android/app/build/outputs/apk/release/app-release.apk hex-android.apk
 
           badging=$("$bt/aapt2" dump badging hex-android.apk)
-          grep -q "package: name='ly.anoma.hex'" <<<"$badging"
-          grep -q "native-code: 'arm64-v8a'" <<<"$badging"
-          grep -q "sdkVersion:'31'" <<<"$badging"
-          "$bt/zipalign" -c -v 4 hex-android.apk >/dev/null
+          printf '%s\n' "$badging" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code):" || true
+
+          printf '%s\n' "$badging" | grep -q "package: name='ly.anoma.hex'" || { echo "::error::Unexpected package name"; exit 1; }
+          printf '%s\n' "$badging" | grep -q "native-code: 'arm64-v8a'" || { echo "::error::arm64-v8a missing"; exit 1; }
+          printf '%s\n' "$badging" | grep -q "sdkVersion:'31'" || { echo "::error::minSdk is not 31"; exit 1; }
+
+          "$bt/zipalign" -c -v 4 hex-android.apk || { echo "::error::APK is not zip-aligned"; exit 1; }
           "$bt/apksigner" verify --verbose --print-certs hex-android.apk
 
           sha256sum hex-android.apk > hex-android.apk.sha256
