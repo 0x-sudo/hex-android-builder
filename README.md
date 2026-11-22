@@ -38,12 +38,6 @@ sha256sum -c hex-android.apk.sha256
 gh attestation verify hex-android.apk --repo 0x-sudo/hex-android-builder
 ```
 
-## Secrets
-
-`HEX_KEYSTORE_B64` and `HEX_KEYSTORE_PASSWORD`.
-
-Back up `~/.config/hex-android/upload.jks` and its password. Lose them and updates need an uninstall.
-
 ## Limits
 
 - Unofficial. Not on Play.
