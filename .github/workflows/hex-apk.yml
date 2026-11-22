@@ -49,7 +49,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          body=$(gh release view android-latest --json body -q .body 2>/dev/null || true)
+          body=$(gh release view --json body -q .body 2>/dev/null || true)
           echo "android=$(sed -n 's/.*android: \([0-9a-f]\{40\}\).*/\1/p' <<<"$body" | head -1)" >> "$GITHUB_OUTPUT"
 
       - name: Decide
@@ -206,16 +206,19 @@ jobs:
             echo "<!-- android: ${ANDROID_SHA} upstream: ${HEAD_SHA} -->"
           } > release-notes.md
 
-      - name: Publish rolling release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release view android-latest >/dev/null 2>&1 || \
-            gh release create android-latest --title "Hex Android (rolling)" --notes "rolling"
-          gh release upload android-latest hex-android.apk hex-android.apk.sha256 --clobber
-          gh release edit android-latest --notes-file release-notes.md
+          tag="android-$VERSION_CODE"
+          gh release create "$tag" --title "Hex $VERSION_NAME" --notes "building"
+          gh release upload "$tag" hex-android.apk hex-android.apk.sha256
+          gh release edit "$tag" --notes-file release-notes.md
+          for old in $(gh release list --limit 100 --json tagName --jq '.[].tagName' | grep '^android-' | grep -vx "$tag" || true); do
+            gh release delete "$old" --yes --cleanup-tag || true
+          done
 
       - name: Summary
         env:

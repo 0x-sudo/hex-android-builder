@@ -7,9 +7,18 @@
 
 ## Download
 
-https://github.com/0x-sudo/hex-android-builder/releases/download/android-latest/hex-android.apk
+https://github.com/0x-sudo/hex-android-builder/releases/latest/download/hex-android.apk
 
-This URL is stable. Each new build overwrites the asset and the checksum.
+This URL always points at the newest build. Each build is its own release, and older ones are deleted.
+
+## Obtainium
+
+1. Install [Obtainium](https://github.com/ImranR98/Obtainium).
+2. Add app → paste `https://github.com/0x-sudo/hex-android-builder`.
+3. Pick `hex-android.apk` if it asks.
+4. Updates arrive when the daily build publishes a new release.
+
+The tag is `android-<versionCode>`, so every build looks like a new version to Obtainium. The signing key never changes, so updates install over the old app.
 
 ## Install
 
