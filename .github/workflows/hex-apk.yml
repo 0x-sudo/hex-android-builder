@@ -3,6 +3,10 @@ name: hex-apk
 on:
   schedule:
     - cron: "17 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/hex-apk.yml"
   workflow_dispatch:
     inputs:
       force:
@@ -77,6 +81,27 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Write signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.HEX_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.HEX_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Missing HEX_KEYSTORE_B64 or HEX_KEYSTORE_PASSWORD repo secret. Add them in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          mkdir -p ~/.config/hex-android
+          printf '%s' "$KEYSTORE_B64" | base64 -d > ~/.config/hex-android/upload.jks
+          cat > ~/.config/hex-android/keystore.properties <<EOF
+          storeFile=upload.jks
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=hex
+          keyPassword=$KEYSTORE_PASSWORD
+          EOF
+          keytool -list -keystore ~/.config/hex-android/upload.jks -storepass "$KEYSTORE_PASSWORD" >/dev/null
+          echo "Signing key OK"
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
@@ -110,26 +135,6 @@ jobs:
           grep -Fq "versionName = \"$name\"" app/build.gradle.kts
           echo "VERSION_CODE=$code" >> "$GITHUB_ENV"
           echo "VERSION_NAME=$name" >> "$GITHUB_ENV"
-
-      - name: Write signing key
-        env:
-          KEYSTORE_B64: ${{ secrets.HEX_KEYSTORE_B64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.HEX_KEYSTORE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
-            echo "::error::Missing HEX_KEYSTORE_B64 or HEX_KEYSTORE_PASSWORD repo secret."
-            exit 1
-          fi
-          mkdir -p ~/.config/hex-android
-          printf '%s' "$KEYSTORE_B64" | base64 -d > ~/.config/hex-android/upload.jks
-          cat > ~/.config/hex-android/keystore.properties <<EOF
-          storeFile=upload.jks
-          storePassword=$KEYSTORE_PASSWORD
-          keyAlias=hex
-          keyPassword=$KEYSTORE_PASSWORD
-          EOF
-          keytool -list -keystore ~/.config/hex-android/upload.jks -storepass "$KEYSTORE_PASSWORD" >/dev/null
 
       - name: Test and build
         working-directory: src/android
