@@ -4,9 +4,14 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when android/ has not changed
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: hex-apk
@@ -16,39 +21,72 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.up.outputs.sha }}
-      build: ${{ steps.up.outputs.sha != steps.last.outputs.sha }}
+      head: ${{ steps.up.outputs.head }}
+      android: ${{ steps.up.outputs.android }}
+      last: ${{ steps.last.outputs.android }}
+      build: ${{ steps.decide.outputs.build }}
     steps:
-      - id: up
-        run: echo "sha=$(git ls-remote https://github.com/anomalyco/hex refs/heads/dev | cut -f1)" >> "$GITHUB_OUTPUT"
+      - name: Find upstream commits
+        id: up
+        run: |
+          api=https://api.github.com/repos/anomalyco/hex
+          head=$(curl -fsSL "$api/commits/dev" | jq -r .sha)
+          android=$(curl -fsSL "$api/commits?path=android&sha=dev&per_page=1" | jq -r '.[0].sha')
+          test -n "$head" && test "$head" != "null"
+          test -n "$android" && test "$android" != "null"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "android=$android" >> "$GITHUB_OUTPUT"
+          echo "upstream dev $head, android/ $android"
 
-      - id: last
+      - name: Read last built commit
+        id: last
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           body=$(gh release view android-latest --json body -q .body 2>/dev/null || true)
-          echo "sha=$(sed -n 's/^upstream: //p' <<<"$body")" >> "$GITHUB_OUTPUT"
+          echo "android=$(sed -n 's/.*android: \([0-9a-f]\{40\}\).*/\1/p' <<<"$body" | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide
+        id: decide
+        env:
+          FORCE: ${{ inputs.force }}
+          NEW: ${{ steps.up.outputs.android }}
+          OLD: ${{ steps.last.outputs.android }}
+        run: |
+          if [ "$FORCE" = "true" ] || [ "$NEW" != "$OLD" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "android/ is unchanged; skipping."
+          fi
 
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/setup-java@v6
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
 
-      - uses: android-actions/setup-android@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
         with:
           packages: "platform-tools platforms;android-36 build-tools;36.0.0 ndk;27.2.12479018 cmake;3.22.1"
 
       - name: Clone upstream
         run: git clone --depth 1 --branch dev https://github.com/anomalyco/hex.git src
 
-      - uses: actions/cache@v6
+      - name: Restore Gradle cache
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -56,29 +94,132 @@ jobs:
           key: gradle-${{ hashFiles('src/android/**/*.gradle*', 'src/android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
-      - name: Write signing key
+      - name: Stamp version
+        working-directory: src/android
+        env:
+          HEAD_SHA: ${{ needs.check.outputs.head }}
         run: |
+          set -euo pipefail
+          code=$(( $(date -u +%y%m%d) * 1000 + GITHUB_RUN_NUMBER % 1000 ))
+          base=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          test -n "$base"
+          name="${base}-$(printf '%s' "$HEAD_SHA" | cut -c1-7)"
+          sed -i -E "s/versionCode = [0-9]+/versionCode = $code/" app/build.gradle.kts
+          sed -i -E "s/versionName = \"[^\"]+\"/versionName = \"$name\"/" app/build.gradle.kts
+          grep -Fq "versionCode = $code" app/build.gradle.kts
+          grep -Fq "versionName = \"$name\"" app/build.gradle.kts
+          echo "VERSION_CODE=$code" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Write signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.HEX_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.HEX_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Missing HEX_KEYSTORE_B64 or HEX_KEYSTORE_PASSWORD repo secret."
+            exit 1
+          fi
           mkdir -p ~/.config/hex-android
-          echo "${{ secrets.HEX_KEYSTORE_B64 }}" | base64 -d > ~/.config/hex-android/upload.jks
+          printf '%s' "$KEYSTORE_B64" | base64 -d > ~/.config/hex-android/upload.jks
           cat > ~/.config/hex-android/keystore.properties <<EOF
           storeFile=upload.jks
-          storePassword=${{ secrets.HEX_KEYSTORE_PASSWORD }}
+          storePassword=$KEYSTORE_PASSWORD
           keyAlias=hex
-          keyPassword=${{ secrets.HEX_KEYSTORE_PASSWORD }}
+          keyPassword=$KEYSTORE_PASSWORD
           EOF
+          keytool -list -keystore ~/.config/hex-android/upload.jks -storepass "$KEYSTORE_PASSWORD" >/dev/null
 
-      - name: Build release APK
+      - name: Test and build
         working-directory: src/android
-        run: ./gradlew assembleRelease --no-daemon
+        run: ./gradlew test assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          bt="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          cp src/android/app/build/outputs/apk/release/app-release.apk hex-android.apk
+
+          badging=$("$bt/aapt2" dump badging hex-android.apk)
+          grep -q "package: name='ly.anoma.hex'" <<<"$badging"
+          grep -q "native-code: 'arm64-v8a'" <<<"$badging"
+          grep -q "sdkVersion:'31'" <<<"$badging"
+          "$bt/zipalign" -c -v 4 hex-android.apk >/dev/null
+          "$bt/apksigner" verify --verbose --print-certs hex-android.apk
+
+          sha256sum hex-android.apk > hex-android.apk.sha256
+          size=$(stat -c%s hex-android.apk)
+          echo "APK_SHA=$(cut -d' ' -f1 hex-android.apk.sha256)" >> "$GITHUB_ENV"
+          echo "APK_SIZE=$(awk -v s="$size" 'BEGIN{printf "%.1f", s/1048576}')" >> "$GITHUB_ENV"
+
+      - name: Attest build
+        uses: actions/attest@v4
+        with:
+          subject-path: hex-android.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: hex-android
+          path: |
+            hex-android.apk
+            hex-android.apk.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Compose release notes
+        env:
+          HEAD_SHA: ${{ needs.check.outputs.head }}
+          ANDROID_SHA: ${{ needs.check.outputs.android }}
+          LAST_SHA: ${{ needs.check.outputs.last }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Built from [anomalyco/hex](https://github.com/anomalyco/hex) \`dev\`."
+            echo
+            echo "> Unofficial personal build. I am just curious and excited to try Hex on Android. Not affiliated with Anomaly."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream | [\`${HEAD_SHA:0:7}\`](https://github.com/anomalyco/hex/commit/$HEAD_SHA) |"
+            echo "| Version | \`$VERSION_NAME\` ($VERSION_CODE) |"
+            echo "| Size | $APK_SIZE MB |"
+            echo "| SHA-256 | \`$APK_SHA\` |"
+            echo
+            if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" != "$ANDROID_SHA" ]; then
+              echo "### Upstream changes"
+              echo
+              curl -fsSL "https://api.github.com/repos/anomalyco/hex/compare/${LAST_SHA}...${ANDROID_SHA}" \
+                | jq -r '.commits[-8:][] | "- `\(.sha[0:7])` \(.commit.message | split("\n")[0])"' || true
+              echo
+            fi
+            echo "Verify: \`gh attestation verify hex-android.apk --repo $REPO\`"
+            echo
+            echo "<!-- android: ${ANDROID_SHA} upstream: ${HEAD_SHA} -->"
+          } > release-notes.md
 
       - name: Publish rolling release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SHA: ${{ needs.check.outputs.sha }}
         run: |
-          cp src/android/app/build/outputs/apk/release/app-release.apk hex-android.apk
+          set -euo pipefail
           gh release view android-latest >/dev/null 2>&1 || \
             gh release create android-latest --title "Hex Android (rolling)" --notes "rolling"
-          gh release upload android-latest hex-android.apk --clobber
-          gh release edit android-latest --notes "upstream: $SHA"
+          gh release upload android-latest hex-android.apk hex-android.apk.sha256 --clobber
+          gh release edit android-latest --notes-file release-notes.md
+
+      - name: Summary
+        env:
+          HEAD_SHA: ${{ needs.check.outputs.head }}
+        run: |
+          {
+            echo "### Hex Android"
+            echo
+            echo "- Version: \`$VERSION_NAME\` ($VERSION_CODE)"
+            echo "- Upstream: \`$HEAD_SHA\`"
+            echo "- Size: $APK_SIZE MB"
+            echo "- SHA-256: \`$APK_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
