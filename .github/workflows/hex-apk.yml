@@ -1,0 +1,87 @@
+name: hex-apk
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hex-apk
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.up.outputs.sha }}
+      build: ${{ steps.up.outputs.sha != steps.last.outputs.sha }}
+    steps:
+      - id: up
+        run: echo "sha=$(git ls-remote https://github.com/anomalyco/hex refs/heads/dev | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - id: last
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          body=$(gh release view android-latest --json body -q .body 2>/dev/null || true)
+          echo "sha=$(sed -n 's/^upstream: //p' <<<"$body")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Clone upstream
+        run: git clone --depth 1 --branch dev https://github.com/anomalyco/hex.git src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('src/android/**/*.gradle*', 'src/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Write signing key
+        run: |
+          mkdir -p ~/.config/hex-android
+          echo "${{ secrets.HEX_KEYSTORE_B64 }}" | base64 -d > ~/.config/hex-android/upload.jks
+          cat > ~/.config/hex-android/keystore.properties <<EOF
+          storeFile=upload.jks
+          storePassword=${{ secrets.HEX_KEYSTORE_PASSWORD }}
+          keyAlias=hex
+          keyPassword=${{ secrets.HEX_KEYSTORE_PASSWORD }}
+          EOF
+
+      - name: Build release APK
+        working-directory: src/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          cp src/android/app/build/outputs/apk/release/app-release.apk hex-android.apk
+          gh release view android-latest >/dev/null 2>&1 || \
+            gh release create android-latest --title "Hex Android (rolling)" --notes "rolling"
+          gh release upload android-latest hex-android.apk --clobber
+          gh release edit android-latest --notes "upstream: $SHA"
