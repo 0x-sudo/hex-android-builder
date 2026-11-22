@@ -1,0 +1,203 @@
+diff --git a/app/src/main/kotlin/app/fonte/net/Http.kt b/app/src/main/kotlin/app/fonte/net/Http.kt
+index dffb42a..26dfa8a 100644
+--- a/app/src/main/kotlin/app/fonte/net/Http.kt
++++ b/app/src/main/kotlin/app/fonte/net/Http.kt
+@@ -1,21 +1,26 @@
+ package app.fonte.net
+ 
+ import android.content.Context
++import android.net.Uri
+ import android.net.http.HttpEngine
+ import android.net.http.HttpException
+ import android.net.http.NetworkException
+ import android.net.http.UrlRequest
+ import android.net.http.UrlResponseInfo
+ import android.os.SystemClock
++import android.util.Base64
+ import android.util.Log
+ import kotlinx.coroutines.CancellableContinuation
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.asExecutor
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.withTimeoutOrNull
++import org.json.JSONObject
+ import java.io.ByteArrayOutputStream
+ import java.io.File
+ import java.io.IOException
+@@ -55,8 +60,8 @@ class Http(private val context: Context) : HttpGet {
+         // Only connection data (HTTP/3 support of hosts), so that QUIC works from the first request after a restart.
+         .setStoragePath(File(context.noBackupFilesDir, "http").apply { mkdirs() }.path)
+         .setEnableHttpCache(HttpEngine.Builder.HTTP_CACHE_DISABLED, 0)
+-        .setEnableQuic(true)
+-        .setEnableHttp2(true)
++        .setEnableQuic(false)
++        .setEnableHttp2(false)
+         .setEnableBrotli(true)
+         .setUserAgent(USER_AGENT)
+         .build()
+@@ -108,8 +113,8 @@ class Http(private val context: Context) : HttpGet {
+     }
+ 
+     /**
+-     * Streams [url] into [to] and hashes it on the way. Fails when the server sends no data for [STALL_MS], when the
+-     * size passes [maxBytes], or when fewer bytes arrive than announced.
++     * Streams [url] into [to], in parallel byte ranges when the server allows it, and hashes it. Fails when the
++     * server sends no data for [STALL_MS], when the size passes [maxBytes], or when fewer bytes arrive than announced.
+      */
+     suspend fun download(
+         url: String,
+@@ -117,6 +122,26 @@ class Http(private val context: Context) : HttpGet {
+         maxBytes: Long,
+         headers: Map<String, String> = emptyMap(),
+         progress: (done: Long, total: Long) -> Unit,
++    ): Download {
++        // GitHub's CDN throttles one connection from some networks. Ask for one byte to learn the size, then fetch
++        // the file as PARTS ranges at once. Anything unexpected falls back to one GET.
++        val probe = runCatching {
++            get(url, headers + ("Range" to "bytes=0-0"), maxBytes = PROBE_BYTES)
++        }.getOrNull()
++        val total = probe?.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull() ?: -1L
++        if (probe?.code != 206 || total <= 0 || total > maxBytes || total < PART_MIN) {
++            return downloadOne(url, to, maxBytes, headers, progress)
++        }
++        return downloadParts(url, to, total, headers, progress)
++    }
++
++    /** The whole file in one GET, for servers without range support and files smaller than [PART_MIN]. */
++    private suspend fun downloadOne(
++        url: String,
++        to: File,
++        maxBytes: Long,
++        headers: Map<String, String>,
++        progress: (done: Long, total: Long) -> Unit,
+     ): Download {
+         val digest = MessageDigest.getInstance("SHA-256")
+         var total = -1L
+@@ -162,6 +187,69 @@ class Http(private val context: Context) : HttpGet {
+         return Download(done, digest.digest().toHex())
+     }
+ 
++    /** [total] bytes as [PARTS] range requests at once, written positionally into [to], then hashed. */
++    private suspend fun downloadParts(
++        url: String,
++        to: File,
++        total: Long,
++        headers: Map<String, String>,
++        progress: (done: Long, total: Long) -> Unit,
++    ): Download = coroutineScope {
++        val parts = minOf(PARTS.toLong(), (total + PART_MIN - 1) / PART_MIN).toInt().coerceAtLeast(1)
++        val size = (total + parts - 1) / parts
++        val done = AtomicLong(0)
++        val last = AtomicLong(System.nanoTime())
++        val lock = Any()
++        FileChannel.open(to.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING).use { out ->
++            val watchdog = launch {
++                while (true) {
++                    delay(STALL_MS / 4)
++                    if (System.nanoTime() - last.get() > STALL_MS * 1_000_000) throw IOException("Download stalled")
++                }
++            }
++            try {
++                (0 until parts).map { i ->
++                    val start = i * size
++                    val end = minOf(total - 1, start + size - 1)
++                    async(Dispatchers.IO) {
++                        var pos = start
++                        exchange(
++                            url,
++                            headers + ("Range" to "bytes=$start-$end"),
++                            onStart = { info ->
++                                if (info.httpStatusCode != 206) throw IOException("Server answered HTTP ${info.httpStatusCode}")
++                            },
++                        ) { buf ->
++                            val n = buf.remaining()
++                            if (pos + n > end + 1) throw IOException("Too much data")
++                            var p = pos
++                            while (buf.hasRemaining()) p += out.write(buf, p)
++                            pos += n
++                            last.set(System.nanoTime())
++                            val now = done.addAndGet(n.toLong())
++                            synchronized(lock) { progress(now, total) }
++                        }
++                        if (pos != end + 1) throw IOException("Download incomplete")
++                    }
++                }.awaitAll()
++            } finally {
++                watchdog.cancel()
++            }
++        }
++        if (to.length() != total) throw IOException("Download incomplete")
++        val digest = MessageDigest.getInstance("SHA-256")
++        to.inputStream().use { input ->
++            val buf = ByteArray(1 shl 20)
++            while (true) {
++                val n = input.read(buf)
++                if (n < 0) break
++                digest.update(buf, 0, n)
++            }
++        }
++        Log.d(TAG, "Downloaded $total bytes from ${URI(url).host} in $parts parts")
++        Download(total, digest.digest().toHex())
++    }
++
+     /** Follows redirects; drops the Authorization header when one leads to another host. */
+     private suspend fun exchange(
+         url: String,
+@@ -237,6 +325,14 @@ class Http(private val context: Context) : HttpGet {
+         private var moved: String? = null
+ 
+         override fun onRedirectReceived(request: UrlRequest, info: UrlResponseInfo, newLocationUrl: String) {
++            // GitHub signs an asset URL for its Azure blob, then serves it through Fastly, which is throttled on
++            // some networks. The same signature works on the Azure origin named in the JWT, and that origin is fast.
++            val direct = directOrigin(newLocationUrl)
++            if (direct != null) {
++                moved = direct
++                request.cancel()
++                return
++            }
+             when (val hop = nextHop(host, newLocationUrl, credentials)) {
+                 Hop.Refuse -> abort(request, IOException("Refused a redirect to an insecure address"))
+                 is Hop.Restart -> {
+@@ -292,6 +388,9 @@ class Http(private val context: Context) : HttpGet {
+         private const val TAG = "FonteHttp"
+         const val AUTHORIZATION = "Authorization"
+         const val MAX_BODY = 8 shl 20
++        private const val PROBE_BYTES = 4096
++        private const val PART_MIN = 1L shl 20
++        private const val PARTS = 8
+         private const val MAX_HOPS = 8
+         private const val BUFFER = 256 shl 10
+         private const val TIMEOUT_MS = 30_000L
+@@ -335,3 +434,27 @@ class Http(private val context: Context) : HttpGet {
+ }
+ 
+ fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
++
++/**
++ * The Azure origin in a Fastly-signed GitHub asset URL, or null when [url] is not one. GitHub puts the origin host
++ * in the JWT's `path` claim; the SAS signature covers the blob, not the host, so the same URL works there.
++ */
++private fun directOrigin(url: String): String? {
++    val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
++    if (uri.host != "release-assets.githubusercontent.com") return null
++    val jwt = uri.getQueryParameter("jwt") ?: return null
++    val payload = jwt.split('.').getOrNull(1) ?: return null
++    val json = runCatching {
++        String(Base64.decode(payload, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
++    }.getOrNull() ?: return null
++    val host = runCatching { JSONObject(json).optString("path") }.getOrNull()
++        ?.takeIf { it.endsWith(".blob.core.windows.net") } ?: return null
++    val query = uri.encodedQuery ?: return null
++    return Uri.Builder()
++        .scheme("https")
++        .authority(host)
++        .encodedPath(uri.encodedPath)
++        .encodedQuery(query)
++        .build()
++        .toString()
++}
