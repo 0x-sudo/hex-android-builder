@@ -117,7 +117,7 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('src/android/**/*.gradle*', 'src/android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: gradle-${{ hashFiles('src/android/**/*.gradle*', 'src/android/**/*.toml', 'src/android/**/*.properties', 'src/android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
       - name: Stamp version
@@ -139,7 +139,7 @@ jobs:
 
       - name: Test and build
         working-directory: src/android
-        run: ./gradlew test assembleRelease --no-daemon --stacktrace
+        run: ./gradlew test assembleRelease --no-daemon --stacktrace --build-cache
 
       - name: Verify APK
         run: |
@@ -148,11 +148,11 @@ jobs:
           cp src/android/app/build/outputs/apk/release/app-release.apk hex-android.apk
 
           badging=$("$bt/aapt2" dump badging hex-android.apk)
-          printf '%s\n' "$badging" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code):" || true
+          printf '%s\n' "$badging" | grep -E "^(package|minSdkVersion|targetSdkVersion|native-code):" || true
 
           printf '%s\n' "$badging" | grep -q "package: name='ly.anoma.hex'" || { echo "::error::Unexpected package name"; exit 1; }
           printf '%s\n' "$badging" | grep -q "native-code: 'arm64-v8a'" || { echo "::error::arm64-v8a missing"; exit 1; }
-          printf '%s\n' "$badging" | grep -q "sdkVersion:'31'" || { echo "::error::minSdk is not 31"; exit 1; }
+          printf '%s\n' "$badging" | grep -q "minSdkVersion:'31'" || { echo "::error::minSdk is not 31"; exit 1; }
 
           "$bt/zipalign" -c -v 4 hex-android.apk || { echo "::error::APK is not zip-aligned"; exit 1; }
           "$bt/apksigner" verify --verbose --print-certs hex-android.apk
